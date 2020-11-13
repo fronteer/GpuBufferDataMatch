@@ -1,0 +1,1 @@
+Used to check whether the outputs (which are usually float values) from two gpu kernels match by examining the data in the two output buffers (excluding NaN and Inf data) and calculating and valuating the Root Mean Square Difference of them
