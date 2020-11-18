@@ -4,7 +4,9 @@
 
 #include <hip/hip_runtime.h>
 #include <sstream>
-#include <
+#include <type_traits>
+#include <cstdint>   // for int8_t
+#include <half.h>    // for host side fp16 
 
 // Here flag can be a constant, variable or function call
 #define MY_HIP_CHECK(flag)                                                                                                      \
@@ -22,11 +24,39 @@
 
 namespace kernelVerify {
 
+enum class DataTypeId_t {
+   DT_FP32 = 1,
+   DT_FP16 = 2,
+   DT_BP16 = 3,
+   DT_INT8 = 4,
+}; 
+
 struct bufferCheckResult
 {
    int numNans; 
    int numInfs; 
    float maxAbsVal; 
+}; 
+
+template <typename T>
+static DataTypeId_t getDataTypeId(); 
+
+template <>
+DataTypeId_t getDataTypeId<float>()
+{
+   return(DT_FP32); 
+}; 
+
+template <>
+DataTypeId_t getDataTypeId<half_float::half>()
+{
+   return(DT_FP16); 
+}; 
+
+template <>
+DataTypeId_t getDataTypeId<int8_t>()
+{
+   return(DT_INT8); 
 }; 
 
 class BufferMatcher
@@ -77,12 +107,15 @@ BufferMatcher::~BufferMatcher() noexcept(false)
 template <typename workType, typename refType>
 int checkBuffer(workType *workBuffer, struct bufferCheckResult *workBufferResult, refType *refBuffer, struct bufferCheckResult *refBufferResult);
 {
+    constexpr refTid = getDataTypeId<refType>(); 
+    constexpr workTid = getDataTypeId<workType>(); 
+
     bufferCheckResult *kernelResult; 
 
     MY_HIP_CHECK( hipHostMalloc(reinterpret_cast<void**>(&kernelResult), sizeof(struct bufferCheckResult), hipHostMallocDefault) ); 
 
     *kernelResult = {0, 0}; 
-    MY_HIP_CHECK( hipLaunchKernelGGL(checkBufferData<refType>, dim3(this->blocks), dim3(BlockSize), 0, this->_stream, refBuffer, kernelResult) ); 
+    MY_HIP_CHECK( hipLaunchKernelGGL(checkBufferData_wrapper<refTid>, dim3(this->blocks), dim3(BlockSize), 0, this->_stream, reinterpret_cast<void*>(refBuffer), kernelResult) ); 
     MY_HIP_CHECK( hipStreamSynchronize(this->_stream) ); 
     *refBufferResult = *kernelResult; 
 
@@ -92,7 +125,7 @@ int checkBuffer(workType *workBuffer, struct bufferCheckResult *workBufferResult
     }; 
 
     *kernelResult = {0, 0};
-    MY_HIP_CHECK( hipLaunchKernelGGL(checkBufferData<workType>, dim3(this->blocks), dim3(BlockSize), 0, this->_stream, workBuffer, kernelResult) );
+    MY_HIP_CHECK( hipLaunchKernelGGL(checkBufferData_wrapper<workTid>, dim3(this->blocks), dim3(BlockSize), 0, this->_stream, reinterpret_cast<void*>(workBuffer), kernelResult) );
     MY_HIP_CHECK( hipStreamSynchronize(this->_stream) );
     *workBufferResult = *kernelResult;
 
@@ -108,14 +141,18 @@ int checkBuffer(workType *workBuffer, struct bufferCheckResult *workBufferResult
     MY_HIP_CHECK( hipHostMalloc(reinterpret_cast<void**>(&kernelMaxAbs), sizeof(float), hipHostMallocDefault) ); 
     MY_HIP_CHECK( hipMalloc(reinterpret_cast<void**>(&workspace), allocUnitSize) ); 
 
-    MY_HIP_CHECK( hipLaunchKernelGGL(getMaxAbsValue_first_call<refType>, dim3(this->blocks), dim3(BlockSize), 0, this->_stream, refBuffer, this->_dataSize, workspace) ); 
-    MY_HIP_CHECK( hipLaunchKernelGGL(getMaxAbsValue_second_call<refType>, dim3(1), dim3(BlockSize), 0, this->_stream, workspace, static_cast<size_t>(this->blocks), kernelMaxAbs) ); 
+    MY_HIP_CHECK( hipLaunchKernelGGL(getMaxAbsValue_first_call_wrapper<refTid>, dim3(this->blocks), dim3(BlockSize), 0, this->_stream, 
+			                          reinterpret_cast<void*>(refBuffer), this->_dataSize, workspace) ); 
+    MY_HIP_CHECK( hipLaunchKernelGGL(getMaxAbsValue_second_call, dim3(1), dim3(BlockSize), 0, this->_stream, 
+			                          reinterpret_cast<float*>(workspace), static_cast<size_t>(this->blocks), kernelMaxAbs) ); 
     MY_HIP_CHECK( hipStreamSynchronize(this->_stream) );
 
     refBufferResult->maxAbsVal = *kernelMaxAbs; 
 
-    MY_HIP_CHECK( hipLaunchKernelGGL(getMaxAbsValue_first_call<workType>, dim3(this->blocks), dim3(BlockSize), 0, this->_stream, workBuffer, this->_dataSize, workspace) ); 
-    MY_HIP_CHECK( hipLaunchKernelGGL(getMaxAbsValue_second_call<workType>, dim3(1), dim3(BlockSize), 0, this->_stream, workspace, static_cast<size_t>(this->blocks), kernelMaxAbs) ); 
+    MY_HIP_CHECK( hipLaunchKernelGGL(getMaxAbsValue_first_call_wrapper<workTid>, dim3(this->blocks), dim3(BlockSize), 0, this->_stream, 
+			                          reinterpret_cast<void*>(workBuffer), this->_dataSize, workspace) ); 
+    MY_HIP_CHECK( hipLaunchKernelGGL(getMaxAbsValue_second_call, dim3(1), dim3(BlockSize), 0, this->_stream, 
+			                          reinterpret_cast<float*>(workspace), static_cast<size_t>(this->blocks), kernelMaxAbs) ); 
     MY_HIP_CHECK( hipStreamSynchronize(this->_stream) );
 
     workBufferResult->maxAbsVal = *kernelMaxAbs; 
@@ -138,13 +175,17 @@ int checkBuffer(workType *workBuffer, struct bufferCheckResult *workBufferResult
 template <typename workType, typname refType>
 void BufferMatcher::computeRMS(workType *workBuffer, refType *refBuffer, float *rms)
 {
+    constexpr refTid = getDataTypeId<refType>(); 
+    constexpr workTid = getDataTypeId<workType>(); 
     double *workspace; 
     double *kernelSum;     // the sum of the square difference calculated by the kernel 
 
     MY_HIP_CHECK( hipMalloc(reinterpret_cast<void**>(&workspace2), this->blocks * sizeof(double)) ); 
 
-    MY_HIP_CHECK( hipLaunchKernelGGL(getSquareDiffSum_first_call<workType, refType>, dim3(this->blocks), dim3(BlockSize), 0, this->_stream, workBuffer, refBuffer, this->_dataSize, workspace) ); 
-    MY_HIP_CHECK( hipLaunchKernelGGL(getSquareDiffSum_second_call<workType, refType>, dim3(1), dim3(BlockSize), 0, this->_stream, workspace, static_cast<size_t>(this->blocks), kernelSum) ); 
+    MY_HIP_CHECK( hipLaunchKernelGGL(getSquareDiffSum_first_call_wrapper<workTid, refTid>, dim3(this->blocks), dim3(BlockSize), 0, this->_stream,
+			       reinterpret_cast<void*>(workBuffer), refBuffer, this->_dataSize, workspace) ); 
+    MY_HIP_CHECK( hipLaunchKernelGGL(getSquareDiffSum_second_call, dim3(1), dim3(BlockSize), 0, this->_stream,
+			       reinterpret_cast<double*>(workspace), static_cast<size_t>(this->blocks), kernelSum) ); 
     MY_HIP_CHECK( hipStreamSynchronize(this->_stream) );
 
     *rms = static_cast<float>(*kernelSum);  
@@ -204,8 +245,46 @@ int BufferMatcher::evaluteAndSimpleReport(workType *workBuffer, refType *refBuff
     return(0); 
 };
 
+template <DataTypeId_t Tid>
+struct get_type_from_id
+{
+    using type = float;
+};
+
+template <>
+struct get_type_from_id<DT_FP32>
+{
+    using type = float;
+};
+
+template <>
+struct get_type_from_id<DT_FP16>
+{
+    using type = _Float16; 
+};
+
+template <>
+struct get_type_from_id<DT_BP16>
+{
+    using type = hip_bfloat16;
+}; 
+
+template <>
+struct get_type_from_id<DT_INT8>
+{
+    using type = int8_t;
+};
+
+template <DataTypeId_t Tid>
+__global__ void checkBufferData_wrapper(void *devBuffer, struct bufferCheckResult *result, size_t bufferSize)
+{
+    using DataType = typename get_type_from_id<Tid>::type; 
+
+    checkBufferData<DataType>(reinterpret_cast<DataType*>(devBuffer), result, bufferSize); 
+}; 
+
 template <typename T>
-__global__ checkBufferData(T *devBuffer, struct bufferCheckResult *result, size_t bufferSize)
+__device__ void checkBufferData(T *devBuffer, struct bufferCheckResult *result, size_t bufferSize)
 {
     int gridSize = hipGridDim_x * hipBlockDim_x; 
     size_t index = hipBlockIdx_x * hipBlockDim_x + hipThreadIdx_x; 
@@ -239,9 +318,17 @@ __global__ checkBufferData(T *devBuffer, struct bufferCheckResult *result, size_
     };  
 }; 
 
+template <DataTypeId_t Tid>
+__global__ void getMaxAbsValue_first_call_wrapper(void *devBuffer, size_t bufferSize, float *workspace)
+{
+    using DataType = typename get_type_from_id<Tid>::type;
+
+    getMaxAbsValue_first_call<DataType>(reinterpret_cast<DataType*>(devBuffer), bufferSize, workspace);
+};
+
 // all-block kernel
 template <typename T> 
-__global__  getMaxAbsValue_first_call(T *devBuffer, size_t bufferSize, T *workspace)
+__device__ void getMaxAbsValue_first_call(T *devBuffer, size_t bufferSize, float *workspace)
 {
     int gridSize = hipGridDim_x * hipBlockDim_x; 
     size_t index = hipBlockIdx_x * hipBlockDim_x + hipThreadIdx_x; 
@@ -272,8 +359,7 @@ __global__  getMaxAbsValue_first_call(T *devBuffer, size_t bufferSize, T *worksp
 }; 
 
 // single-block kernel
-template <typename T>
-__global__  getMaxAbsValue_second_call(T *workspace, size_t bufferSize, float *result)
+__global___  void getMaxAbsValue_second_call(float *workspace, size_t bufferSize, float *result)
 {
     size_t index = hipThreadIdx_x; 
 
@@ -282,8 +368,8 @@ __global__  getMaxAbsValue_second_call(T *workspace, size_t bufferSize, float *r
     __shared__ float maxValues[BlockSize]; 
 
     while ( index < bufferSize ) {
-        if ( myMaxAbs < fabsf(static_cast<float>(workspace[index])) )
-	     myMaxAbs = fabsf(static_cast<float>(workspace[index])); 
+        if ( myMaxAbs < workspace[index] )
+	     myMaxAbs = workspace[index]; 
 
         index += BlockSize; 	
     }; 
@@ -302,9 +388,18 @@ __global__  getMaxAbsValue_second_call(T *workspace, size_t bufferSize, float *r
          *result = maxValues[0]; 
 };
 
+template <DataTypeId Tid1, DataTypeId Tid2>
+__global__ void getSquareDiffSum_first_call_wrapper(void *devBuffer1, void *devBuffer2, size_t bufferSize, double *workspace)
+{
+    using DataType1 = typename get_type_from_id<Tid1>::type;
+    using DataType2 = typename get_type_from_id<Tid2>::type;
+
+    getSquareDiffSum_first_call<DataType1, DataType2>(reinterpret_cast<DataType1*>(devBuffer1), reinterpret_cast<DataType2*>(devBuffer2), bufferSize, workspace); 
+}; 
+
 // all-block kernel
 template <typename T1, typename T2>
-__global__ getSquareDiffSum_first_call(T1 *devBuffer1, T2 *devBuffer2, size_t bufferSize, double *workspace)
+__device__ void getSquareDiffSum_first_call(T1 *devBuffer1, T2 *devBuffer2, size_t bufferSize, double *workspace)
 {
     int gridSize = hipGridDim_x * hipBlockDim_x; 
     size_t index = hipBlockIdx_x * hipBlockDim_x + hipThreadIdx_x; 
@@ -335,7 +430,7 @@ __global__ getSquareDiffSum_first_call(T1 *devBuffer1, T2 *devBuffer2, size_t bu
 }; 
 
 // single-block kernel for getSquareDiffSum
-__global__ getSquareDiffSum_second_call(double *workspace, size_t bufferSize, double *result)
+__global__ void getSquareDiffSum_second_call(double *workspace, size_t bufferSize, double *result)
 {
     size_t index = hipThreadIdx_x; 
 
