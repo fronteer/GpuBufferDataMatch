@@ -1,6 +1,6 @@
 HIPCC=/opt/rocm/hip/bin/hipcc
 
-CFLAGS := -std=c++11 
+CFLAGS := -std=c++11
 
 PROGRAMS :=  bufferMatch_test 
 
