@@ -1,6 +1,6 @@
 HIPCC=/opt/rocm/hip/bin/hipcc
 
-CFLAGS := 
+CFLAGS := -std=c++11 
 
 PROGRAMS :=  bufferMatch_test 
 
@@ -8,7 +8,7 @@ all: $(PROGRAMS)
 
 # Step
 
-bufferMatch_test:  bufferMatch.o
+bufferMatch_test:  bufferMatch_test.o
 	$(HIPCC) -o $@ $< 
 
 %.o: %.cpp
