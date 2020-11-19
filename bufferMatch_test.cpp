@@ -5,7 +5,7 @@
 #include <random>
 #include <chrono>
 
-const size_t dataSize = 1024*2048;  
+const size_t dataSize = 8192*8192;  
 
 static void *workHostBuffer;
 static void *refHostBuffer; 
@@ -21,11 +21,15 @@ int main()
    MY_HIP_CHECK( hipStreamCreate(&stream) ); 
 
    BufferMatcher bufferMatch(stream, 80.0f, dataSize);  
+   BufferMatcher bufferMatch2(stream, 200.0f, dataSize);  // the tolerance value should be further improved if conversion loss to be considered in specific situation 
+
+   int testNo = 0; 
 
    try {
        // test case 1 -- check the NaN and Infinite data in the float buffer
        {
-           std::cout << std::endl; 
+           testNo++; 
+           std::cout << std::endl << "------- Testing case " << testNo << " ------- " << std::endl; 
            workHostBuffer = reinterpret_cast<void*>( new float[dataSize] );  
           
            MY_HIP_CHECK( hipMalloc(&workDevBuffer, dataSize * sizeof(float)) ); 
@@ -48,7 +52,7 @@ int main()
 	   }; 
 
            // randomly set the values of three elements to Infinite
-           for (int i=0; i < 3; i++) {
+           for (int i=0; i < 5; i++) {
                 size_t index = distribution(generator);
 
                 reinterpret_cast<float*>(workHostBuffer)[index] = std::numeric_limits<float>::infinity();
@@ -69,7 +73,9 @@ int main()
 
        // test case 2 -- check the situation where the referrence buffer consists of all-zero values, and the other buffer have one non-zero value with 50% probability
        {
-           std::cout << std::endl; 
+           testNo++;
+           std::cout << std::endl << "------- Testing case " << testNo << " ------- " << std::endl; 
+           workHostBuffer = reinterpret_cast<void*>( new float[dataSize] );  
            workHostBuffer = reinterpret_cast<void*>( new float[dataSize] );
            refHostBuffer = reinterpret_cast<void*>( new float[dataSize] );
 
@@ -103,9 +109,11 @@ int main()
            delete [] reinterpret_cast<float*>(refHostBuffer); 
        }; 
 
-       // test case 3 -- compare between buffers of same type which are initialized to same data
+       // test case 3 -- compare between buffers of same float type which are initialized to same data
        {
-           std::cout << std::endl; 
+           testNo++;
+           std::cout << std::endl << "------- Testing case " << testNo << " ------- " << std::endl; 
+           workHostBuffer = reinterpret_cast<void*>( new float[dataSize] );  
            workHostBuffer = reinterpret_cast<void*>( new float[dataSize] );  
            refHostBuffer = reinterpret_cast<void*>( new float[dataSize] );  
    
@@ -116,7 +124,7 @@ int main()
            std::default_random_engine generator(seed);
            std::uniform_int_distribution<size_t> distribution(0,dataSize-1);	   
    
-           // set up the two buffers with complete same data
+           // set up the two buffers with completely same data values
            for (int i=0; i < dataSize; i++) {
                 float val = (float)distribution(generator) / (float)dataSize - 0.5f; 
 
@@ -137,7 +145,8 @@ int main()
 
        // test case 4 -- compare between buffers of same type which are initialized to same data, but the working buffer has 10 values corruptted to zero
        {
-           std::cout << std::endl; 
+           testNo++;
+           std::cout << std::endl << "------- Testing case " << testNo << " ------- " << std::endl; 
            workHostBuffer = reinterpret_cast<void*>( new float[dataSize] );
            refHostBuffer = reinterpret_cast<void*>( new float[dataSize] );
 
@@ -148,7 +157,7 @@ int main()
            std::default_random_engine generator(seed);
            std::uniform_int_distribution<size_t> distribution(0,dataSize-1);
 
-           // set up the two buffers with complete same data
+           // set up the two buffers with completely same data values
            for (int i=0; i < dataSize; i++) {
                 float val = (float)distribution(generator) / (float)dataSize - 0.5f;
 
@@ -156,6 +165,7 @@ int main()
                 reinterpret_cast<float*>(refHostBuffer)[i] = val;
            };
 
+           // corrupt the some values in the working buffer
            for (int i=0; i < 10; i++) {
                 size_t index = distribution(generator) % dataSize; 
 
@@ -175,7 +185,8 @@ int main()
 
        // test case 5 -- check the NaN and Infinite data in the fp16 buffer
        {
-           std::cout << std::endl;
+           testNo++;
+           std::cout << std::endl << "------- Testing case " << testNo << " ------- " << std::endl; 
            workHostBuffer = reinterpret_cast<void*>( new half_float::half[dataSize] );
 
            MY_HIP_CHECK( hipMalloc(&workDevBuffer, dataSize * sizeof(half_float::half)) );
@@ -194,14 +205,14 @@ int main()
            for (int i=0; i < 3; i++) {
                 size_t index = distribution(generator);
 
-                reinterpret_cast<half_float::half*>(workHostBuffer)[index] = static_cast<half_float::half>( std::numeric_limits<float>::quiet_NaN() );
+                reinterpret_cast<half_float::half*>(workHostBuffer)[index] = std::numeric_limits<half_float::half>::quiet_NaN();
            };
 
            // randomly set the values of three elements to Infinite
-           for (int i=0; i < 3; i++) {
+           for (int i=0; i < 5; i++) {
                 size_t index = distribution(generator);
 
-                reinterpret_cast<half_float::half*>(workHostBuffer)[index] = static_cast<half_float::half>( std::numeric_limits<float>::infinity() );
+                reinterpret_cast<half_float::half*>(workHostBuffer)[index] = std::numeric_limits<half_float::half>::infinity();
            };
 
            MY_HIP_CHECK( hipMemcpy(workDevBuffer, workHostBuffer, dataSize * sizeof(half_float::half), hipMemcpyHostToDevice) );
@@ -215,6 +226,230 @@ int main()
 
            MY_HIP_CHECK( hipFree(workDevBuffer) );
            delete [] reinterpret_cast<half_float::half*>(workHostBuffer);
+       };
+
+       // test case 6 -- compare between a working buffer of fp16 type and a referrence buffer of float type, data of which are initialized to same values; 
+       {
+           testNo++;
+           std::cout << std::endl << "------- Testing case " << testNo << " ------- " << std::endl; 
+           workHostBuffer = reinterpret_cast<void*>( new half_float::half[dataSize] );
+           refHostBuffer = reinterpret_cast<void*>( new float[dataSize] );
+
+           MY_HIP_CHECK( hipMalloc(&workDevBuffer, dataSize * sizeof(half_float::half)) );
+           MY_HIP_CHECK( hipMalloc(&refDevBuffer, dataSize * sizeof(float)) );
+
+           unsigned int seed = std::chrono::system_clock::now().time_since_epoch().count();
+           std::default_random_engine generator(seed);
+           std::uniform_int_distribution<size_t> distribution(0,dataSize-1);
+
+           // set up the two buffers with completely same data values
+           for (int i=0; i < dataSize; i++) {
+		half_float::half val = static_cast<half_float::half>( (float)distribution(generator) / (float)dataSize - 0.5f ); 
+
+                reinterpret_cast<half_float::half*>(workHostBuffer)[i] = val;
+                reinterpret_cast<float*>(refHostBuffer)[i] = static_cast<float>(val);
+           };
+
+           MY_HIP_CHECK( hipMemcpy(workDevBuffer, workHostBuffer, dataSize * sizeof(half_float::half), hipMemcpyHostToDevice) );
+           MY_HIP_CHECK( hipMemcpy(refDevBuffer, refHostBuffer, dataSize * sizeof(float), hipMemcpyHostToDevice) );
+
+           bufferMatch2.evaluateAndSimpleReport<half_float::half,float>(reinterpret_cast<half_float::half*>(workDevBuffer),reinterpret_cast<float*>(refDevBuffer));
+
+           MY_HIP_CHECK( hipFree(workDevBuffer) );
+           MY_HIP_CHECK( hipFree(refDevBuffer) );
+           delete [] reinterpret_cast<half_float::half*>(workHostBuffer);
+           delete [] reinterpret_cast<float*>(refHostBuffer);
+       };
+       
+       // test case 7 -- compare between a working buffer of fp16 type and a referrence buffer of float type, data of which are initialized to same values, 
+       //                but the working buffer has 10 values corruptted to zero              
+       {
+           testNo++;
+           std::cout << std::endl << "------- Testing case " << testNo << " ------- " << std::endl;
+           workHostBuffer = reinterpret_cast<void*>( new half_float::half[dataSize] );
+           refHostBuffer = reinterpret_cast<void*>( new float[dataSize] );
+
+           MY_HIP_CHECK( hipMalloc(&workDevBuffer, dataSize * sizeof(half_float::half)) );
+           MY_HIP_CHECK( hipMalloc(&refDevBuffer, dataSize * sizeof(float)) );
+
+           unsigned int seed = std::chrono::system_clock::now().time_since_epoch().count();
+           std::default_random_engine generator(seed);
+           std::uniform_int_distribution<size_t> distribution(0,dataSize-1);
+
+           // set up the two buffers with completely same data values
+           for (int i=0; i < dataSize; i++) {
+		half_float::half val = static_cast<half_float::half>( (float)distribution(generator) / (float)dataSize - 0.5f ); 
+
+                reinterpret_cast<half_float::half*>(workHostBuffer)[i] = val; 
+                reinterpret_cast<float*>(refHostBuffer)[i] = static_cast<float>(val);
+           };
+
+           // corrupt the some values in the working buffer
+           for (int i=0; i < 10; i++) {
+                size_t index = distribution(generator) % dataSize;
+
+                reinterpret_cast<half_float::half*>(workHostBuffer)[index] = static_cast<half_float::half>(0.0f);
+           };
+
+           MY_HIP_CHECK( hipMemcpy(workDevBuffer, workHostBuffer, dataSize * sizeof(half_float::half), hipMemcpyHostToDevice) );
+           MY_HIP_CHECK( hipMemcpy(refDevBuffer, refHostBuffer, dataSize * sizeof(float), hipMemcpyHostToDevice) );
+
+           bufferMatch2.evaluateAndSimpleReport<half_float::half,float>(reinterpret_cast<half_float::half*>(workDevBuffer),reinterpret_cast<float*>(refDevBuffer));
+
+           MY_HIP_CHECK( hipFree(workDevBuffer) );
+           MY_HIP_CHECK( hipFree(refDevBuffer) );
+           delete [] reinterpret_cast<half_float::half*>(workHostBuffer);
+           delete [] reinterpret_cast<float*>(refHostBuffer);
+       };
+
+       // test case 8 -- compare between a working buffer of bp16 type and a referrence buffer of float type, data of which are initialized to same values; 
+       {
+           testNo++;
+           std::cout << std::endl << "------- Testing case " << testNo << " ------- " << std::endl;
+           workHostBuffer = reinterpret_cast<void*>( new bfloat16[dataSize] );
+           refHostBuffer = reinterpret_cast<void*>( new float[dataSize] );
+
+           MY_HIP_CHECK( hipMalloc(&workDevBuffer, dataSize * sizeof(bfloat16)) );
+           MY_HIP_CHECK( hipMalloc(&refDevBuffer, dataSize * sizeof(float)) );
+
+           unsigned int seed = std::chrono::system_clock::now().time_since_epoch().count();
+           std::default_random_engine generator(seed);
+           std::uniform_int_distribution<size_t> distribution(0,dataSize-1);
+
+           // set up the two buffers with completely same data values
+           for (int i=0; i < dataSize; i++) {
+                bfloat16 val = static_cast<bfloat16>( (float)distribution(generator) / (float)dataSize - 0.5f );
+
+                reinterpret_cast<bfloat16*>(workHostBuffer)[i] = val;
+                reinterpret_cast<float*>(refHostBuffer)[i] = static_cast<float>(val);
+           };
+
+           MY_HIP_CHECK( hipMemcpy(workDevBuffer, workHostBuffer, dataSize * sizeof(bfloat16), hipMemcpyHostToDevice) );
+           MY_HIP_CHECK( hipMemcpy(refDevBuffer, refHostBuffer, dataSize * sizeof(float), hipMemcpyHostToDevice) );
+
+           bufferMatch2.evaluateAndSimpleReport<bfloat16,float>(reinterpret_cast<bfloat16*>(workDevBuffer),reinterpret_cast<float*>(refDevBuffer));
+
+           MY_HIP_CHECK( hipFree(workDevBuffer) );
+           MY_HIP_CHECK( hipFree(refDevBuffer) );
+           delete [] reinterpret_cast<bfloat16*>(workHostBuffer);
+           delete [] reinterpret_cast<float*>(refHostBuffer);
+       };
+
+       // test case 9 -- compare between a working buffer of bfloat16 type and a referrence buffer of float type, data of which are initialized to same values, 
+       //                but the working buffer has 10 values corruptted to zero              
+       {
+           testNo++;
+           std::cout << std::endl << "------- Testing case " << testNo << " ------- " << std::endl;
+           workHostBuffer = reinterpret_cast<void*>( new bfloat16[dataSize] );
+           refHostBuffer = reinterpret_cast<void*>( new float[dataSize] );
+
+           MY_HIP_CHECK( hipMalloc(&workDevBuffer, dataSize * sizeof(bfloat16)) );
+           MY_HIP_CHECK( hipMalloc(&refDevBuffer, dataSize * sizeof(float)) );
+
+           unsigned int seed = std::chrono::system_clock::now().time_since_epoch().count();
+           std::default_random_engine generator(seed);
+           std::uniform_int_distribution<size_t> distribution(0,dataSize-1);
+
+           // set up the two buffers with completely same data values
+           for (int i=0; i < dataSize; i++) {
+                bfloat16 val = static_cast<bfloat16>( (float)distribution(generator) / (float)dataSize - 0.5f );
+
+                reinterpret_cast<half_float::half*>(workHostBuffer)[i] = val;
+                reinterpret_cast<float*>(refHostBuffer)[i] = static_cast<float>(val);
+           };
+
+           // corrupt the some values in the working buffer
+           for (int i=0; i < 10; i++) {
+                size_t index = distribution(generator) % dataSize;
+
+                reinterpret_cast<bfloat16*>(workHostBuffer)[index] = static_cast<half_float::half>(0.0f);
+           };
+
+           MY_HIP_CHECK( hipMemcpy(workDevBuffer, workHostBuffer, dataSize * sizeof(bfloat16), hipMemcpyHostToDevice) );
+           MY_HIP_CHECK( hipMemcpy(refDevBuffer, refHostBuffer, dataSize * sizeof(float), hipMemcpyHostToDevice) );
+
+           bufferMatch2.evaluateAndSimpleReport<bfloat16,float>(reinterpret_cast<bfloat16*>(workDevBuffer),reinterpret_cast<float*>(refDevBuffer));
+
+           MY_HIP_CHECK( hipFree(workDevBuffer) );
+           MY_HIP_CHECK( hipFree(refDevBuffer) );
+           delete [] reinterpret_cast<bfloat16*>(workHostBuffer);
+           delete [] reinterpret_cast<float*>(refHostBuffer);
+       };
+
+       // test case 10 -- compare between a working buffer of int8_t type and a referrence buffer of float type, data of which are initialized to same values; 
+       {
+           testNo++;
+           std::cout << std::endl << "------- Testing case " << testNo << " ------- " << std::endl;
+           workHostBuffer = reinterpret_cast<void*>( new int8_t[dataSize] );
+           refHostBuffer = reinterpret_cast<void*>( new float[dataSize] );
+
+           MY_HIP_CHECK( hipMalloc(&workDevBuffer, dataSize * sizeof(int8_t)) );
+           MY_HIP_CHECK( hipMalloc(&refDevBuffer, dataSize * sizeof(float)) );
+
+           unsigned int seed = std::chrono::system_clock::now().time_since_epoch().count();
+           std::default_random_engine generator(seed);
+           std::uniform_int_distribution<size_t> distribution(0,dataSize-1);
+
+           // set up the two buffers with completely same data values
+           int8_t maxVal = std::numeric_limits<int8_t>::max(); 
+           for (int i=0; i < dataSize; i++) {
+                int8_t val = static_cast<int8_t>( ((float)distribution(generator)/(float)dataSize - 0.5f ) * (float)maxVal );
+
+                reinterpret_cast<int8_t*>(workHostBuffer)[i] = val;
+                reinterpret_cast<float*>(refHostBuffer)[i] = static_cast<float>(val);
+           };
+
+           MY_HIP_CHECK( hipMemcpy(workDevBuffer, workHostBuffer, dataSize * sizeof(int8_t), hipMemcpyHostToDevice) );
+           MY_HIP_CHECK( hipMemcpy(refDevBuffer, refHostBuffer, dataSize * sizeof(float), hipMemcpyHostToDevice) );
+
+           bufferMatch2.evaluateAndSimpleReport<int8_t,float>(reinterpret_cast<int8_t*>(workDevBuffer),reinterpret_cast<float*>(refDevBuffer));
+
+           MY_HIP_CHECK( hipFree(workDevBuffer) );
+           MY_HIP_CHECK( hipFree(refDevBuffer) );
+           delete [] reinterpret_cast<int8_t*>(workHostBuffer);
+           delete [] reinterpret_cast<float*>(refHostBuffer);
+       };
+
+       // test case 11 -- compare between a working buffer of int8_t type and a referrence buffer of float type, data of which are initialized to same values, 
+       //                but the working buffer has 10 values corruptted to zero              
+       {
+           testNo++;
+           std::cout << std::endl << "------- Testing case " << testNo << " ------- " << std::endl;
+           workHostBuffer = reinterpret_cast<void*>( new int8_t[dataSize] );
+           refHostBuffer = reinterpret_cast<void*>( new float[dataSize] );
+
+           MY_HIP_CHECK( hipMalloc(&workDevBuffer, dataSize * sizeof(int8_t)) );
+           MY_HIP_CHECK( hipMalloc(&refDevBuffer, dataSize * sizeof(float)) );
+
+           unsigned int seed = std::chrono::system_clock::now().time_since_epoch().count();
+           std::default_random_engine generator(seed);
+           std::uniform_int_distribution<size_t> distribution(0,dataSize-1);
+
+           // set up the two buffers with completely same data values
+           int8_t maxVal = std::numeric_limits<int8_t>::max(); 
+           for (int i=0; i < dataSize; i++) {
+                int8_t val = static_cast<int8_t>( ((float)distribution(generator)/(float)dataSize - 0.5f ) * (float)maxVal );
+
+                reinterpret_cast<half_float::half*>(workHostBuffer)[i] = val;
+                reinterpret_cast<float*>(refHostBuffer)[i] = static_cast<float>(val);
+           };
+
+           // corrupt some values in the working buffer
+           for (int i=0; i < 10; i++) {
+                size_t index = distribution(generator) % dataSize;
+
+                reinterpret_cast<bfloat16*>(workHostBuffer)[index] = static_cast<int8_t>(0.0f);
+           };
+
+           MY_HIP_CHECK( hipMemcpy(workDevBuffer, workHostBuffer, dataSize * sizeof(int8_t), hipMemcpyHostToDevice) );
+           MY_HIP_CHECK( hipMemcpy(refDevBuffer, refHostBuffer, dataSize * sizeof(float), hipMemcpyHostToDevice) );
+
+           bufferMatch2.evaluateAndSimpleReport<int8_t,float>(reinterpret_cast<int8_t*>(workDevBuffer),reinterpret_cast<float*>(refDevBuffer));
+
+           MY_HIP_CHECK( hipFree(workDevBuffer) );
+           MY_HIP_CHECK( hipFree(refDevBuffer) );
+           delete [] reinterpret_cast<int8_t*>(workHostBuffer);
+           delete [] reinterpret_cast<float*>(refHostBuffer);
        };
 
    } 

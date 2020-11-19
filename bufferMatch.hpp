@@ -10,6 +10,10 @@
 #include <cstdint>   // for int8_t
 #include <half.hpp>    // for host side fp16 
 
+#include <hip/hip_bfloat16.h>     // kernel-used bp16
+
+#include "bfloat16.hpp"           // host-used bp16
+
 // Here flag can be a constant, variable or function call
 #define MY_HIP_CHECK(flag)                                                                                                      \
     do  {                                                                                                                       \
@@ -53,6 +57,12 @@ template <>
 constexpr DataTypeId_t getDataTypeId<half_float::half>()
 {
    return(DT_FP16); 
+}; 
+
+template <>
+constexpr DataTypeId_t getDataTypeId<bfloat16>()
+{
+   return(DT_BP16); 
 }; 
 
 template <>
@@ -232,7 +242,7 @@ void BufferMatcher::computeRMS(workType *workBuffer, refType *refBuffer, float *
 			       reinterpret_cast<double*>(workspace), static_cast<size_t>(this->blocks), kernelSum); 
     MY_HIP_CHECK( hipStreamSynchronize(this->_stream) );
 
-    *rms = static_cast<float>(*kernelSum);  
+    *rms = sqrt(static_cast<float>(*kernelSum) / (float)this->_dataSize);   
 };
 
     
@@ -279,8 +289,9 @@ int BufferMatcher::evaluateAndSimpleReport(workType *workBuffer, refType *refBuf
 
     computeRMS<workType,refType>(workBuffer, refBuffer, &rms); 
 
-    if ( (sqrtf(rms/(float)this->_dataSize)) / refBufferResult.maxAbsVal  > this->_epsilon ) {
+    if ( rms / refBufferResult.maxAbsVal  > this->_epsilon ) {
           std::cerr << "The evaluated data seems not consistent with that of the referrence buffer!" << std::endl; 
+	  std::cerr << "The calculated RMS is " << std::dec << rms << ", the relative error is " << rms / refBufferResult.maxAbsVal << ", the tolerance threshold is " << this->_epsilon << std::endl;  
           return(-2); 	      
     }; 
 
@@ -307,11 +318,11 @@ struct get_type_from_id<DT_FP16>
     using type = _Float16; 
 };
 
-//template <>
-//struct get_type_from_id<DT_BP16>
-//{
-//    using type = hip_bfloat16;
-//}; 
+template <>
+struct get_type_from_id<DT_BP16>
+{
+    using type = hip_bfloat16;
+}; 
 
 template <>
 struct get_type_from_id<DT_INT8>
