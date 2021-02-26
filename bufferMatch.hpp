@@ -31,12 +31,9 @@
 #include <stdexcept>
 #include <limits>
 #include <type_traits>
-#include <cstdint>   // for int8_t
+#include <cstdint>     // for int8_t
 #include <half.hpp>    // for host side fp16 
-
-#include <hip/hip_bfloat16.h>     // kernel-used bp16
-
-#include "bfloat16.hpp"           // host-used bp16
+#include <hip/hip_fp16.h>  // for kernel side fp16
 
 // Here flag can be a constant, variable or function call
 #define MY_HIP_CHECK(flag)                                                                                                      \
@@ -57,11 +54,10 @@ static const int BlockSize = 256;
 enum DataTypeId_t {
    DT_FP32 = 1,
    DT_FP16 = 2,
-   DT_BP16 = 3,
    DT_INT8 = 4,
 }; 
 
-struct bufferCheckResult
+struct bufferCheckStat
 {
    int numNans; 
    int numInfs; 
@@ -84,29 +80,23 @@ constexpr DataTypeId_t getDataTypeId<half_float::half>()
 }; 
 
 template <>
-constexpr DataTypeId_t getDataTypeId<bfloat16>()
-{
-   return(DT_BP16); 
-}; 
-
-template <>
 constexpr DataTypeId_t getDataTypeId<int8_t>()
 {
    return(DT_INT8); 
 }; 
 
-class BufferMatcher
+class BufferCompare
 {
 public:
-    BufferMatcher(hipStream_t stream, float tolerance, size_t dataSize);
+    BufferCompare(hipStream_t stream, float tolerance, size_t dataSize);
 
-    ~BufferMatcher() noexcept(false); 
+    ~BufferCompare() noexcept(false); 
 
     template <typename dataType> 
-    int simpleCheckBuffer(dataType *devBuffer, struct bufferCheckResult *bufferResult); 
+    int simpleCheckBuffer(dataType *devBuffer, struct bufferCheckStat &stat); 
 
     template <typename workType, typename refType>
-    int checkBuffers(workType *workBuffer, struct bufferCheckResult *workBufferResult, refType *refBuffer, struct bufferCheckResult *refBufferResult); 
+    int checkBuffers(workType *workBuffer, struct bufferCheckStat &workBufferStat, refType *refBuffer, struct bufferCheckStat &refBufferStat); 
 
     template <typename workType, typename refType>
     void computeRMS(workType *devBuffer1, refType *devBuffer2, float *rms); 
@@ -121,9 +111,11 @@ private:
     int _deviceId; 
 
     int blocks; // the number of blocks to dispatch for all-block kernels 
+
+    bufferCheckStat *kernelStat; 
 };
 
-BufferMatcher::BufferMatcher(hipStream_t stream, float tolerance, size_t dataSize)
+BufferCompare::BufferCompare(hipStream_t stream, float tolerance, size_t dataSize)
 {
     _epsilon = std::numeric_limits<float>::epsilon() * tolerance; 
     _dataSize = dataSize;  
@@ -136,77 +128,69 @@ BufferMatcher::BufferMatcher(hipStream_t stream, float tolerance, size_t dataSiz
     MY_HIP_CHECK( hipGetDeviceProperties(&prop, this->_deviceId) ); 
 
     this->blocks = prop.multiProcessorCount * 4;  // to dispatch 4 blocks per CU for all-block kernels
+
+    MY_HIP_CHECK( hipHostMalloc(reinterpret_cast<void**>(&kernelStat), sizeof(struct bufferCheckStat), hipHostMallocDefault) );
 };
 
-BufferMatcher::~BufferMatcher() noexcept(false)
+BufferCompare::~BufferCompare() noexcept(false)
 {
+    MY_HIP_CHECK( hipHostFree(reinterpret_cast<void*>(kernelStat)) );
 }; 
 
 // In-advance declarations
 template <DataTypeId_t Tid>
-__global__ void checkBufferData_wrapper(void *devBuffer, struct bufferCheckResult *result, size_t bufferSize);
+__global__ void checkBufferData_wrapper(void *devBuffer, struct bufferCheckStat *stat, size_t bufferSize);
 
 template <DataTypeId_t Tid>
 __global__ void getMaxAbsValue_first_call_wrapper(void *devBuffer, size_t bufferSize, float *workspace);
 
-__global__  void getMaxAbsValue_second_call(float *workspace, size_t bufferSize, float *result);
+__global__  void getMaxAbsValue_second_call(float *workspace, size_t bufferSize, float *stat);
 
 template <DataTypeId_t Tid1, DataTypeId_t Tid2>
 __global__ void getSquareDiffSum_first_call_wrapper(void *devBuffer1, void *devBuffer2, size_t bufferSize, double *workspace);
 
-__global__ void getSquareDiffSum_second_call(double *workspace, size_t bufferSize, double *result);
+__global__ void getSquareDiffSum_second_call(double *workspace, size_t bufferSize, double *stat);
 
 
 template <typename dataType>
-int BufferMatcher::simpleCheckBuffer(dataType *devBuffer, struct bufferCheckResult *bufferResult)
+int BufferCompare::simpleCheckBuffer(dataType *devBuffer, struct bufferCheckStat &stat)
 {
     constexpr DataTypeId_t Tid = getDataTypeId<dataType>(); 
-    bufferCheckResult *kernelResult;
     int retVal = 0; 
 
-    MY_HIP_CHECK( hipHostMalloc(reinterpret_cast<void**>(&kernelResult), sizeof(struct bufferCheckResult), hipHostMallocDefault) );
-
-    *kernelResult = {0, 0};
-    hipLaunchKernelGGL(checkBufferData_wrapper<Tid>, dim3(this->blocks), dim3(BlockSize), 0, this->_stream, reinterpret_cast<void*>(devBuffer), kernelResult, this->_dataSize);
+    *kernelStat = {0, 0};
+    hipLaunchKernelGGL(checkBufferData_wrapper<Tid>, dim3(this->blocks), dim3(BlockSize), 0, this->_stream, reinterpret_cast<void*>(devBuffer), kernelStat, this->_dataSize);
     MY_HIP_CHECK( hipStreamSynchronize(this->_stream) );
-    *bufferResult = *kernelResult;
+    stat = *kernelStat;
 
-    if (bufferResult->numNans > 0 || bufferResult->numInfs > 0 ) 
+    if (stat.numNans > 0 || stat.numInfs > 0 ) 
         retVal = -1; 	
-
-    MY_HIP_CHECK( hipHostFree(reinterpret_cast<void*>(kernelResult)) );
 
     return(retVal); 
 }; 
 
 
 template <typename workType, typename refType>
-int BufferMatcher::checkBuffers(workType *workBuffer, struct bufferCheckResult *workBufferResult, refType *refBuffer, struct bufferCheckResult *refBufferResult)
+int BufferCompare::checkBuffers(workType *workBuffer, struct bufferCheckStat &workBufferStat, refType *refBuffer, struct bufferCheckStat &refBufferStat)
 {
     constexpr DataTypeId_t refTid = getDataTypeId<refType>(); 
     constexpr DataTypeId_t workTid = getDataTypeId<workType>(); 
 
-    bufferCheckResult *kernelResult; 
-
-    MY_HIP_CHECK( hipHostMalloc(reinterpret_cast<void**>(&kernelResult), sizeof(struct bufferCheckResult), hipHostMallocDefault) ); 
-
-    *kernelResult = {0, 0}; 
-    hipLaunchKernelGGL(checkBufferData_wrapper<refTid>, dim3(this->blocks), dim3(BlockSize), 0, this->_stream, reinterpret_cast<void*>(refBuffer), kernelResult, this->_dataSize); 
+    *kernelStat = {0, 0}; 
+    hipLaunchKernelGGL(checkBufferData_wrapper<refTid>, dim3(this->blocks), dim3(BlockSize), 0, this->_stream, reinterpret_cast<void*>(refBuffer), kernelStat, this->_dataSize); 
     MY_HIP_CHECK( hipStreamSynchronize(this->_stream) ); 
-    *refBufferResult = *kernelResult; 
+    refBufferStat = *kernelStat; 
 
-    if ( refBufferResult->numNans > 0 || refBufferResult->numInfs > 0 ) {
-         MY_HIP_CHECK( hipHostFree(reinterpret_cast<void*>(kernelResult)) ); 
+    if ( refBufferStat.numNans > 0 || refBufferStat.numInfs > 0 ) {
          return(-1); 
     }; 
 
-    *kernelResult = {0, 0};
-    hipLaunchKernelGGL(checkBufferData_wrapper<workTid>, dim3(this->blocks), dim3(BlockSize), 0, this->_stream, reinterpret_cast<void*>(workBuffer), kernelResult, this->_dataSize);
+    *kernelStat = {0, 0};
+    hipLaunchKernelGGL(checkBufferData_wrapper<workTid>, dim3(this->blocks), dim3(BlockSize), 0, this->_stream, reinterpret_cast<void*>(workBuffer), kernelStat, this->_dataSize);
     MY_HIP_CHECK( hipStreamSynchronize(this->_stream) );
-    *workBufferResult = *kernelResult;
+    workBufferStat = *kernelStat;
 
-    if ( workBufferResult->numNans > 0 || workBufferResult->numInfs > 0 ) {
-         MY_HIP_CHECK( hipHostFree(reinterpret_cast<void*>(kernelResult)) ); 
+    if ( workBufferStat.numNans > 0 || workBufferStat.numInfs > 0 ) {
          return(-2); 
     }; 
 
@@ -222,7 +206,7 @@ int BufferMatcher::checkBuffers(workType *workBuffer, struct bufferCheckResult *
 			                          reinterpret_cast<float*>(workspace), static_cast<size_t>(this->blocks), kernelMaxAbs); 
     MY_HIP_CHECK( hipStreamSynchronize(this->_stream) );
 
-    refBufferResult->maxAbsVal = *kernelMaxAbs; 
+    refBufferStat.maxAbsVal = *kernelMaxAbs; 
 
     hipLaunchKernelGGL(getMaxAbsValue_first_call_wrapper<workTid>, dim3(this->blocks), dim3(BlockSize), 0, this->_stream, 
 			                          reinterpret_cast<void*>(workBuffer), this->_dataSize, workspace); 
@@ -230,25 +214,24 @@ int BufferMatcher::checkBuffers(workType *workBuffer, struct bufferCheckResult *
 			                          reinterpret_cast<float*>(workspace), static_cast<size_t>(this->blocks), kernelMaxAbs);
     MY_HIP_CHECK( hipStreamSynchronize(this->_stream) );
 
-    workBufferResult->maxAbsVal = *kernelMaxAbs; 
+    workBufferStat.maxAbsVal = *kernelMaxAbs; 
 
-    MY_HIP_CHECK( hipHostFree(reinterpret_cast<void*>(kernelResult)) );
     MY_HIP_CHECK( hipHostFree(reinterpret_cast<void*>(kernelMaxAbs)) );
     MY_HIP_CHECK( hipFree(reinterpret_cast<void*>(workspace)) ); 
 
     float epsilon = std::numeric_limits<float>::epsilon(); 
 
-    if ( refBufferResult->maxAbsVal < epsilon && workBufferResult->maxAbsVal < epsilon ) 
+    if ( refBufferStat.maxAbsVal < epsilon && workBufferStat.maxAbsVal < epsilon ) 
 	 return(1);   // both buffers are all-zero 
  
-    if ( refBufferResult->maxAbsVal <= epsilon && workBufferResult->maxAbsVal > epsilon ) 
+    if ( refBufferStat.maxAbsVal <= epsilon && workBufferStat.maxAbsVal > epsilon ) 
 	 return(-3); 
 
     return(0); 
 }; 
 
 template <typename workType, typename refType>
-void BufferMatcher::computeRMS(workType *workBuffer, refType *refBuffer, float *rms)
+void BufferCompare::computeRMS(workType *workBuffer, refType *refBuffer, float *rms)
 {
     constexpr DataTypeId_t refTid = getDataTypeId<refType>(); 
     constexpr DataTypeId_t workTid = getDataTypeId<workType>(); 
@@ -271,29 +254,29 @@ void BufferMatcher::computeRMS(workType *workBuffer, refType *refBuffer, float *
 
     
 template <typename workType, typename refType>
-int BufferMatcher::evaluateAndSimpleReport(workType *workBuffer, refType *refBuffer)
+int BufferCompare::evaluateAndSimpleReport(workType *workBuffer, refType *refBuffer)
 { 
-    struct bufferCheckResult refBufferResult = {0,0,0.0f};  	
-    struct bufferCheckResult workBufferResult = {0,0,0.0f}; 
+    struct bufferCheckStat refBufferStat = {0,0,0.0f};  	
+    struct bufferCheckStat workBufferStat = {0,0,0.0f}; 
 
     
-    int ret = checkBuffers<workType, refType>(workBuffer, &workBufferResult, refBuffer, &refBufferResult); 
+    int ret = checkBuffers<workType, refType>(workBuffer, workBufferStat, refBuffer, refBufferStat); 
 
     if ( ret == -1 ) {
-         if ( refBufferResult.numNans > 0 )
-              std::cerr << refBufferResult.numNans << " NaN values found in the referrence data buffer." << std::endl; 
-         if ( refBufferResult.numInfs > 0 )
-              std::cerr << refBufferResult.numInfs << " Infinite values found in referrence data buffer." << std::endl;
+         if ( refBufferStat.numNans > 0 )
+              std::cerr << refBufferStat.numNans << " NaN values found in the referrence data buffer." << std::endl; 
+         if ( refBufferStat.numInfs > 0 )
+              std::cerr << refBufferStat.numInfs << " Infinite values found in referrence data buffer." << std::endl;
 
          std::cerr << "The evaluation could not be executed!" << std::endl; 
          return(-2);         
     }
 
     if ( ret == -2 ) {
-         if ( workBufferResult.numNans > 0 )
-              std::cerr << refBufferResult.numNans << " NaN values found in the work data buffer." << std::endl;
-         if ( workBufferResult.numInfs > 0 )
-              std::cerr << refBufferResult.numInfs << " Infinite values found in work data buffer." << std::endl;
+         if ( workBufferStat.numNans > 0 )
+              std::cerr << refBufferStat.numNans << " NaN values found in the work data buffer." << std::endl;
+         if ( workBufferStat.numInfs > 0 )
+              std::cerr << refBufferStat.numInfs << " Infinite values found in work data buffer." << std::endl;
 
          std::cerr << "The evaluation could not be executed!" << std::endl;
          return(-2);
@@ -313,9 +296,9 @@ int BufferMatcher::evaluateAndSimpleReport(workType *workBuffer, refType *refBuf
 
     computeRMS<workType,refType>(workBuffer, refBuffer, &rms); 
 
-    if ( rms / refBufferResult.maxAbsVal  > this->_epsilon ) {
+    if ( rms / refBufferStat.maxAbsVal  > this->_epsilon ) {
           std::cerr << "The evaluated data seems not consistent with that of the referrence buffer!" << std::endl; 
-	  std::cerr << "The calculated RMS is " << std::dec << rms << ", the relative error is " << rms / refBufferResult.maxAbsVal << ", the tolerance threshold is " << this->_epsilon << std::endl;  
+	  std::cerr << "The calculated RMS is " << std::dec << rms << ", the relative error is " << rms / refBufferStat.maxAbsVal << ", the tolerance threshold is " << this->_epsilon << std::endl;  
           return(-2); 	      
     }; 
 
@@ -323,6 +306,8 @@ int BufferMatcher::evaluateAndSimpleReport(workType *workBuffer, refType *refBuf
 
     return(0); 
 };
+
+typedef _Float16 half_t;
 
 template <DataTypeId_t Tid>
 struct get_type_from_id
@@ -339,14 +324,8 @@ struct get_type_from_id<DT_FP32>
 template <>
 struct get_type_from_id<DT_FP16>
 {
-    using type = _Float16; 
+    using type = half_t; 
 };
-
-template <>
-struct get_type_from_id<DT_BP16>
-{
-    using type = hip_bfloat16;
-}; 
 
 template <>
 struct get_type_from_id<DT_INT8>
@@ -354,13 +333,28 @@ struct get_type_from_id<DT_INT8>
     using type = int8_t;
 };
 
+static inline __device__ half_t abs(half_t x)
+{
+    return __habs(x); 
+}; 
+
+static inline __device__ bool isnan(half_t x)
+{
+    return __hisnan(x); 
+}; 
+
+static inline __device__ bool isfinite(half_t x)
+{
+    return __hisinf(x); 
+};
+
 template <typename T>
-__device__ void checkBufferData(T *devBuffer, struct bufferCheckResult *result, size_t bufferSize)
+__device__ void checkBufferData(T *devBuffer, struct bufferCheckStat *pStat, size_t bufferSize)
 {
     int gridSize = hipGridDim_x * hipBlockDim_x; 
     size_t index = hipBlockIdx_x * hipBlockDim_x + hipThreadIdx_x; 
 
-    __shared__ bufferCheckResult blkResult; 
+    __shared__ bufferCheckStat blkResult; 
 
     if ( hipThreadIdx_x == 0 ) {
 	 blkResult.numNans = 0; 
@@ -370,10 +364,10 @@ __device__ void checkBufferData(T *devBuffer, struct bufferCheckResult *result, 
     __syncthreads(); 
 
     while ( index < bufferSize ) {
-         if ( isnan(static_cast<float>(devBuffer[index])) ) 
+         if ( isnan(devBuffer[index]) ) 
 	      (void)atomicAdd(&blkResult.numNans,1);
 
-         if ( isinf(static_cast<float>(devBuffer[index])) ) 
+         if ( isfinite(devBuffer[index]) ) 
 	      (void)atomicAdd(&blkResult.numInfs,1);
 
 	 index += gridSize;  
@@ -383,18 +377,18 @@ __device__ void checkBufferData(T *devBuffer, struct bufferCheckResult *result, 
 
     if ( hipThreadIdx_x == 0 ) {
          if ( blkResult.numNans > 0 ) 
-	      (void)atomicAdd(&result->numNans,blkResult.numNans); 
+	      (void)atomicAdd(&pStat->numNans,blkResult.numNans); 
 	 if ( blkResult.numInfs > 0 )
-              (void)atomicAdd(&result->numInfs,blkResult.numInfs); 
+              (void)atomicAdd(&pStat->numInfs,blkResult.numInfs); 
     };  
 }; 
 
 template <DataTypeId_t Tid>
-__global__ void checkBufferData_wrapper(void *devBuffer, struct bufferCheckResult *result, size_t bufferSize)
+__global__ void checkBufferData_wrapper(void *devBuffer, struct bufferCheckStat *pStat, size_t bufferSize)
 {
     using DataType = typename get_type_from_id<Tid>::type;
 
-    checkBufferData<DataType>(reinterpret_cast<DataType*>(devBuffer), result, bufferSize);
+    checkBufferData(reinterpret_cast<DataType*>(devBuffer), pStat, bufferSize);
 };
 
 // all-block kernel
@@ -409,8 +403,8 @@ __device__ void getMaxAbsValue_first_call(T *devBuffer, size_t bufferSize, float
     __shared__ float maxValues[BlockSize]; 
 
     while ( index < bufferSize ) {
-        if ( myMaxAbs < fabsf(static_cast<float>(devBuffer[index])) )
-	     myMaxAbs = fabsf(static_cast<float>(devBuffer[index])); 
+        if ( myMaxAbs < static_cast<float>(abs(devBuffer[index])) ) 
+	     myMaxAbs = static_cast<float>(abs(devBuffer[index])); 
 
         index += gridSize; 	
     }; 
@@ -434,7 +428,7 @@ __global__ void getMaxAbsValue_first_call_wrapper(void *devBuffer, size_t buffer
 {
     using DataType = typename get_type_from_id<Tid>::type;
 
-    getMaxAbsValue_first_call<DataType>(reinterpret_cast<DataType*>(devBuffer), bufferSize, workspace);
+    getMaxAbsValue_first_call(reinterpret_cast<DataType*>(devBuffer), bufferSize, workspace);
 };
 
 // single-block kernel
@@ -479,8 +473,8 @@ __device__ void getSquareDiffSum_first_call(T1 *devBuffer1, T2 *devBuffer2, size
     __shared__ double sumValues[BlockSize]; 
 
     while ( index < bufferSize ) {
-        float diff = static_cast<T1>(devBuffer1[index]) -static_cast<T2>(devBuffer2[index]); 
-        mySum += static_cast<double>(diff) * static_cast<double>(diff); 
+        double diff = static_cast<double>(devBuffer1[index]) -static_cast<double>(devBuffer2[index]); 
+        mySum += diff * diff; 
 
         index += gridSize; 	
     }; 
@@ -505,7 +499,7 @@ __global__ void getSquareDiffSum_first_call_wrapper(void *devBuffer1, void *devB
     using DataType1 = typename get_type_from_id<Tid1>::type;
     using DataType2 = typename get_type_from_id<Tid2>::type;
 
-    getSquareDiffSum_first_call<DataType1, DataType2>(reinterpret_cast<DataType1*>(devBuffer1), reinterpret_cast<DataType2*>(devBuffer2), bufferSize, workspace);
+    getSquareDiffSum_first_call(reinterpret_cast<DataType1*>(devBuffer1), reinterpret_cast<DataType2*>(devBuffer2), bufferSize, workspace);
 };
 
 // single-block kernel for getSquareDiffSum
@@ -536,6 +530,7 @@ __global__ void getSquareDiffSum_second_call(double *workspace, size_t bufferSiz
     if ( hipThreadIdx_x == 0 )
          *result = sumValues[0]; 
 }; 
+
 
 }; // end of namespace 
 
